@@ -1188,6 +1188,12 @@ def main() -> None:
         help="exit non-zero unless all platform collectors and imports completed",
     )
     args = parser.parse_args()
+    from tagagent.host import singleton
+    with singleton("importer"):
+        _run_monitor(args)
+
+
+def _run_monitor(args):
     if args.loop:
         run_forever(args.interval)
     else:

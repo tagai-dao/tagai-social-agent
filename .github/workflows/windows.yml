@@ -1,0 +1,21 @@
+name: Windows smoke test
+on: [push, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  desktop:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install, register task, test isolated Chrome and importer
+        shell: powershell
+        run: |
+          ./scripts/install-windows.ps1 -RegisterTask
+          $task = Get-ScheduledTask -TaskName 'TagAI Social Feed Worker'
+          if ($task.Actions.Execute -ne "$pwd\.venv\Scripts\python.exe") { throw "Bad task action" }
+          Unregister-ScheduledTask -TaskName $task.TaskName -Confirm:$false
+          .\.venv\Scripts\python.exe tests/desktop_smoke.py
+          exit $LASTEXITCODE

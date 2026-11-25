@@ -14,7 +14,7 @@ import json
 import logging
 import os
 import re
-import signal
+from tagagent.host import chrome_path, dedicated_chrome, singleton, busy
 import subprocess
 import sys
 import threading
@@ -35,7 +35,7 @@ from tagagent.wiki import load_json, save_json
 
 
 LOG = logging.getLogger("tagagent.social.feed-worker")
-CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+# Chrome is resolved at startup.
 PROFILE = config.RUNTIME_ROOT / "social-callouts" / "chrome-worker-profile"
 STATE = config.RUNTIME_ROOT / "social-callouts" / "persistent-worker-state.json"
 HEALTH = config.RUNTIME_ROOT / "social-callouts" / "persistent-worker-health.json"
@@ -248,7 +248,7 @@ class PersistentFeedWorker:
         DIAGNOSTICS.mkdir(parents=True, exist_ok=True)
         self.playwright = sync_playwright().start()
         command = [
-            CHROME, f"--user-data-dir={PROFILE}", "--remote-debugging-port=9223",
+            chrome_path(), f"--user-data-dir={PROFILE}", "--remote-debugging-port=9223",
             "--no-first-run", "--no-default-browser-check",
             "--disable-background-timer-throttling", "--disable-renderer-backgrounding",
         ]
@@ -276,6 +276,8 @@ class PersistentFeedWorker:
                 endpoint_ready = True
         except Exception:
             pass
+        if endpoint_ready and not dedicated_chrome(PROFILE):
+            raise RuntimeError("Port 9223 is occupied by another browser; refusing to attach")
         if not endpoint_ready:
             self.chrome_process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             self.owns_chrome = True
@@ -420,43 +422,16 @@ class PersistentFeedWorker:
     @staticmethod
     def _restart_dedicated_chrome() -> None:
         """Restart only Chrome's main process for this worker profile."""
-        listing = subprocess.run(
-            ["ps", "-axo", "pid=,command="], capture_output=True, text=True,
-            check=False,
-        ).stdout
-        marker = f"--user-data-dir={PROFILE}"
-        pids: list[int] = []
-        for line in listing.splitlines():
-            stripped = line.strip()
-            if marker not in stripped or "--remote-debugging-port=9223" not in stripped:
-                continue
-            if not re.search(r"/Google Chrome(?:\.app/Contents/MacOS/Google Chrome)?\s", stripped):
-                continue
+        import psutil
+        for process in dedicated_chrome(PROFILE):
             try:
-                pids.append(int(stripped.split(None, 1)[0]))
-            except (ValueError, IndexError):
-                continue
-        for pid in pids:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-        deadline = time.monotonic() + 8
-        while pids and time.monotonic() < deadline:
-            alive = []
-            for pid in pids:
+                process.terminate()
                 try:
-                    os.kill(pid, 0)
-                    alive.append(pid)
-                except ProcessLookupError:
-                    pass
-            pids = alive
-            if pids:
-                time.sleep(0.25)
-        for pid in pids:
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
+                    process.wait(8)
+                except psutil.TimeoutExpired:
+                    process.kill()
+                    process.wait(8)
+            except psutil.NoSuchProcess:
                 pass
 
     @staticmethod
@@ -3239,21 +3214,7 @@ def _consume(*, timeout: int = 120) -> bool:
 
 def _external_consumer_running() -> bool:
     """Detect an importer owned by a previous Worker/heartbeat process."""
-    listing = subprocess.run(
-        ["ps", "-axo", "pid=,command="], capture_output=True, text=True,
-        check=False,
-    ).stdout
-    marker = "-m tagagent.agents.social.callout_monitor"
-    for line in listing.splitlines():
-        if marker not in line:
-            continue
-        try:
-            pid = int(line.strip().split(None, 1)[0])
-        except (ValueError, IndexError):
-            continue
-        if pid != os.getpid():
-            return True
-    return False
+    return busy("importer")
 
 
 def _start_consumer(
@@ -3392,6 +3353,11 @@ def main() -> None:
         help="hard seconds allowed for one TagAI import process",
     )
     args = parser.parse_args()
+    with singleton("worker"):
+        _run_worker(args)
+
+
+def _run_worker(args):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     worker = PersistentFeedWorker(headless=args.headless)
     worker.start()
